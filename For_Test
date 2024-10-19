@@ -1,0 +1,70 @@
+import os
+from groq import Groq
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, Application
+
+class TelegramBot:
+    def __init__(self):
+        self.client = Groq(api_key=os.environ.get("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"))
+        self.app = application = Application.builder().token("7202304469:AAGiMVbv5BCLbOGv3dnvBNW5PLSyrHvX824").build()
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.app.add_handler(MessageHandler(filters.COMMAND, self.unknown_command))
+        self.app.add_handler(CallbackQueryHandler(self.button_handler))
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка команды /start и отправка приветственного сообщения с инлайн-кнопкой."""
+        keyboard = [
+            [InlineKeyboardButton("About us", callback_data='creator_info')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(f'Hello {update.effective_user.first_name}', reply_markup=reply_markup)
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка взаимодействий с кнопками инлайн-клавиатуры."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == 'creator_info':
+            await query.edit_message_text(text="We are cool people.")
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка любых текстовых сообщений от пользователя."""
+        user_message = update.message.text
+        response = await self.send_to_groq_api(user_message)
+        if len(response) > 4096:
+            for i in range(0, len(response), 4000):
+                await update.message.reply_text(response[i:i + 4000])
+        else:
+            await update.message.reply_text(response)
+
+    async def send_to_groq_api(self, message: str) -> str:
+        """Отправка сообщения в API Groq и возврат ответа."""
+        try:
+            chat_completion = await self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": message,
+                    }
+                ],
+                model="mixtral-8x7b-32768",
+            )
+            return chat_completion.choices[0].message.content
+
+        except Exception as e:
+            return f"An error occurred while communicating with the Groq API: {e}"
+
+    async def unknown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка неизвестных команд."""
+        await update.message.reply_text("Sorry, I didn't understand that command.")
+
+    def run(self):
+        """Запуск бота и начало опроса обновлений."""
+        self.app.run_polling()
+
+if __name__ == "__main__":
+    bot = TelegramBot()
+    bot.run()
+
