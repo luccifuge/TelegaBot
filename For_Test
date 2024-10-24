@@ -1,70 +1,276 @@
-import os
+import os, requests, sqlite3 , pytz, schedule, time
+from platform import system
+import openai
+from bs4 import BeautifulSoup
 from groq import Groq
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, Application
+
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, \
+    CallbackQueryHandler, Application
+from datetime import datetime, timedelta
+
+
+conn = sqlite3.connect('messages.db')
+c = conn.cursor()
+c.execute('''
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        message TEXT,
+        is_bot BOOLEAN,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+
+conn.commit()
+
 
 class TelegramBot:
     def __init__(self):
-        self.client = Groq(api_key=os.environ.get("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"))
-        self.app = application = Application.builder().token("7202304469:AAGiMVbv5BCLbOGv3dnvBNW5PLSyrHvX824").build()
+
+        PROXY_API_KEY = os.environ.get("sk-8C0s3SZaqTvM81bYBCLze5wF8doijBWS")
+        self.client = openai.Client(
+            api_key=PROXY_API_KEY,
+            base_url="https://api.proxyapi.ru/openai/v1",
+        )
+        self.weather_api_key = os.environ.get("baa5297c6f6d46bfba0203749242410")
+        self.app = application = Application.builder().token("7202304469:AAGiMVbv5BCLbOGv3dnvBNW5PLSyrHvX824").read_timeout(2000).build()
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        self.app.add_handler(MessageHandler(filters.COMMAND, self.unknown_command))
-        self.app.add_handler(CallbackQueryHandler(self.button_handler))
+        #self.app.add_handler(MessageHandler(filters.COMMAND, self.unknown_command))
+        self.app.add_handler(CommandHandler("get_messages", self.get_messages))  # для вытаскиевания всех сообщений
+        self.app.add_handler(CommandHandler("summ", self.summarize_messages))  # для обработки команды summ
+        self.app.add_handler(CommandHandler("help", self.help))  # для обработки команды help
+        self.app.add_handler(CommandHandler("weather", self.weather_command))
+        self.app.add_handler(CommandHandler("about", self.about))
+        # self.app.add_handler(CommandHandler("pic", self.pic_command)) пока не работает
+
+        # очистка базы данных каждый час
+        schedule.every().hour.do(self.clear_database)
+
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка команды /start и отправка приветственного сообщения с инлайн-кнопкой."""
-        keyboard = [
-            [InlineKeyboardButton("About us", callback_data='creator_info')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(f'Привет, {update.effective_user.first_name}!', parse_mode='Markdown')
 
-        await update.message.reply_text(f'Hello {update.effective_user.first_name}', reply_markup=reply_markup)
+    def clear_database(self):
+        c.execute('DELETE FROM messages')  # очищаем таблицу сообщений
+        conn.commit()
 
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка взаимодействий с кнопками инлайн-клавиатуры."""
-        query = update.callback_query
-        await query.answer()
+    def run_schedule(self):
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
 
-        if query.data == 'creator_info':
-            await query.edit_message_text(text="We are cool people.")
+    async def run(self):
+        import threading
+        threading.Thread(target=self.run_schedule, daemon=True).start()
+
+        await self.app.run_polling()
+
+
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"При возникновении каких-то ошибок - пишите @luccifuge", parse_mode='Markdown')
+
+    async def about(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"Привет! Я чат-бот с подключенным Chat GPT 4o - mini. Я могу ответить на"
+                                        f" любые вопросы, поддержать диалог. \n По команде summ, я могу собрать короткий рассказ "
+                                        f"что и кем (с именами) обсуждалось в чате, если вы не успеваете следить за перепиской "
+                                        f"ваших друзей или коллег, очень полезная вещь. Для этого сообщения заносятся в базу данных и обновляются постоянно", parse_mode='Markdown')
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка любых текстовых сообщений от пользователя."""
+        """Обработка любых текстовых сообщений от пользователя"""
         user_message = update.message.text
-        response = await self.send_to_groq_api(user_message)
+        user_id = update.effective_user.id
+        username = update.effective_user.username or "Unknown"
+
+        # это в бд
+        self.save_message(user_id, username, user_message)
+
+        # ответ на любое сообщение в лс
+        if update.message.chat.type == "private":
+            response = await self.send_to_groq_api(user_message, command='other_command')
+            await self.send_response(update, response)
+            return
+
+        # проверка ответ на сообщение бота в чатах
+        if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+            response = await self.send_to_groq_api(user_message, command='other_command')
+            await self.send_response(update, response)
+
+    async def send_response(self, update: Update, response: str):
+        """Отправка ответа пользователю"""
+
+        # сохраняем последний ответ бота для генерации, потом надо доделать чтобы не только последнее
+        self.save_message(update.effective_user.id, "bot", response, is_bot=True)
+
         if len(response) > 4096:
             for i in range(0, len(response), 4000):
-                await update.message.reply_text(response[i:i + 4000])
+                await update.message.reply_text(response[i:i + 4000],parse_mode='Markdown')
         else:
-            await update.message.reply_text(response)
+            await update.message.reply_text(response, parse_mode='Markdown')
 
-    async def send_to_groq_api(self, message: str) -> str:
-        """Отправка сообщения в API Groq и возврат ответа."""
+
+
+
+    def save_message(self, user_id: int, username: str, message: str, is_bot: bool = False) -> None:
+        """Сохранение сообщения в базу данных"""
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        current_time = datetime.now(moscow_tz).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO messages (user_id, username, message, is_bot, timestamp) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, username, message, is_bot, current_time))
+        conn.commit()
+
+    def encode_text(text: str) -> str:
+        """Плохо работал русский язык и я пробовал таким образом испрапвить все"""
+        return text.encode('utf-8', errors='replace').decode('utf-8')
+
+    async def get_last_bot_response(self) -> str:
+        """Получение последнего сообщения бота из бд"""
+        c.execute("SELECT message FROM messages WHERE is_bot=1 ORDER BY timestamp DESC LIMIT 1")
+        result = c.fetchone()
+        return result[0] if result else ""
+
+    def get_weather_data(self, city: str) -> str:
+        """Функция для получения погоды в указанном городе (по умолчанию Москва)"""
+        url = f"http://api.weatherapi.com/v1/current.json?key={self.weather_api_key}&q={city}&aqi=no"
+
+        response = requests.get(url)
+        print(f"Response status code: {response.status_code}")  # Вывод статуса
+        print(f"Response text: {response.text}")  # Вывод текста ответа
+
+        if response.status_code == 200:
+            data = response.json()
+            temp = data['current']['temp_c']
+            weather_description = data['current']['condition']['text']
+            return f"Температура в {city}: {temp}°C, {weather_description}."
+        else:
+            return "Не удалось получить данные о погоде."
+
+    async def weather_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Функция для получения погоды в Москве"""
+        city = "Moscow"
+        weather_info = self.get_weather_data(city)
+
+        # Отправляем данные пользователю
+        await update.message.reply_text(weather_info, parse_mode='Markdown')
+
+    async def get_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Вывод всех сообщений из бд, по факту не имеет смысла, нужна была для настройки"""
+        c.execute("SELECT username, message FROM messages ORDER BY timestamp DESC")
+        messages = c.fetchall()
+
+        if not messages:
+            await update.message.reply_text("Нет сообщений.", parse_mode='Markdown')
+            return
+
+        response = "n".join([f"{(username)}: {(message)}" for username, message in messages])
+        if len(response) > 4096:
+            for i in range(0, len(response), 4000):
+                await update.message.reply_text(response[i:i + 4000], parse_mode='Markdown')
+        else:
+            await update.message.reply_text(response, parse_mode='Markdown')
+
+    async def summarize_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Генерация последних 20 мин для ИИ"""
+        twenty_minutes_ago = datetime.now() - timedelta(minutes=20)
+
+        c.execute("SELECT user_id, message FROM messages WHERE timestamp >= ?", (twenty_minutes_ago,))
+        messages = c.fetchall()
+
+        if not messages:
+            await update.message.reply_text("Нет сообщений за последние 20 минут.", parse_mode='Markdown')
+            return
+
+        messages_text = " ".join([msg[1] for msg in messages])
+        user_ids = set(msg[0] for msg in messages)
+
+
+        user_names = {user_id: await self.get_user_name(user_id, context) for user_id in user_ids}
+
+
+        users_info = ", ".join([f"{(user_names[user_id])} " for user_id in user_ids])
+
+        full_message = f"Сообщения от: {users_info}nn{messages_text}"
+
+
+        full_message_encoded = full_message
+
+        summary_response = await self.send_to_groq_api(full_message_encoded, command='/summ')
+        final_response = summary_response
+
+        if len(final_response) > 4096:
+            for i in range(0, len(final_response), 4000):
+                await update.message.reply_text(final_response[i:i + 4000], parse_mode='Markdown')
+        else:
+            await update.message.reply_text(final_response, parse_mode='Markdown')
+
+    async def get_user_name(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """Получение имени пользователя по его id из тг"""
         try:
-            chat_completion = await self.client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": message,
-                    }
-                ],
-                model="mixtral-8x7b-32768",
+            user = await context.bot.get_chat(user_id)
+            return user.first_name if user.first_name else "Неизвестный пользователь"
+        except Exception as e:
+            print(f"Ошибка при получении имени пользователя: {e}")
+            return "Неизвестный пользователь"
+
+
+
+    async def send_to_groq_api(self, message: str, command: str) -> str:
+        """Отправка сообщения в openai и возврат ответа"""
+        try:
+            messages = []
+
+            # полчаем последний ответ бота для использования
+            previous_response = await self.get_last_bot_response()
+
+            if previous_response:
+                system_message = {
+                    "role": "system",
+                    "content": f"В предыдущем ответе было сказано: '{previous_response}'. Используй это в контексте для ответа."
+                }
+                messages.append(system_message)
+
+           
+            if command == '/summ':
+                system_message = {
+                    "role": "system",
+                    "content": "Сгенерируй короткий пересказ что обсуждалось в чате, указывая имена тех, кто писал это в чате"
+                }
+            elif command == '/weather':
+                system_message = {
+                    "role": "system",
+                    "content": "Сгенерируй сообщение о погоде на сегодня и на завтра, напиши сколько градусов утром, днем и вечером"
+                }
+            else:
+                system_message = {
+                    "role": "system",
+                    "content": "Выведи ответ "
+                }
+
+            messages.append(system_message)
+            messages.append({
+                "role": "user",
+                "content": message,
+            })
+
+            chat_completion = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
             )
             return chat_completion.choices[0].message.content
-
         except Exception as e:
             return f"An error occurred while communicating with the Groq API: {e}"
 
-    async def unknown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка неизвестных команд."""
-        await update.message.reply_text("Sorry, I didn't understand that command.")
 
     def run(self):
-        """Запуск бота и начало опроса обновлений."""
+        """Запуск бота"""
         self.app.run_polling()
 
 if __name__ == "__main__":
     bot = TelegramBot()
     bot.run()
+
+
+
 
