@@ -1,0 +1,242 @@
+import pytest
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+import sqlite3
+from datetime import datetime, timedelta
+import pytz
+from telegram import Update, Chat, Message, User
+from telegram.ext import ContextTypes
+import requests
+
+from BotTelega import TelegramBot
+
+
+@pytest.fixture
+def mock_db():
+    """имтация подключения к бд"""
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    return mock_conn, mock_cursor
+
+
+@pytest.fixture
+def bot(mock_db):
+    """создаем экземпляр бота"""
+    mock_conn, _ = mock_db
+    with patch('openai.Client'), \
+            patch('telegram.ext.Application.builder'), \
+            patch('sqlite3.connect', return_value=mock_conn), \
+            patch('schedule.every') as mock_schedule:
+        bot = TelegramBot()
+        mock_schedule.hour.do.return_value = None
+        return bot
+
+
+@pytest.fixture
+def mock_update():
+    """создаем макет с реал данными"""
+    message = AsyncMock()
+    message.text = "тестовон_сообщение"
+    message.chat_id = 456
+    message.chat = AsyncMock()
+    message.chat.type = "private"
+    message.chat.id = 456
+    message.reply_text = AsyncMock()
+    message.from_user = AsyncMock(
+        id=123,
+        username="test_user",
+        first_name="Test",
+        full_name="Test User"
+    )
+
+    update = AsyncMock(spec=Update)
+    update.effective_user = message.from_user
+    update.message = message
+    return update
+
+
+@pytest.fixture
+def mock_context():
+    """"""
+    context = AsyncMock(spec=ContextTypes.DEFAULT_TYPE)
+    context.bot = AsyncMock()
+    context.bot.id = 999
+    context.bot.get_me = AsyncMock(return_value=AsyncMock(username="test_bot"))
+    context.bot.get_chat_member = AsyncMock(return_value=AsyncMock(
+        user=AsyncMock(full_name="Test User")
+    ))
+    return context
+
+
+@pytest.mark.asyncio
+async def test_start_command(bot, mock_update, mock_context):
+    """тест start с разными именами пользователей"""
+    test_cases = [
+        ("John", "Привет, John!"),
+        ("GO", "Привет, GO!"),
+        ("", "Привет, !"),
+        ("John Smith", "Привет, John Smith!")
+    ]
+
+    for name, expected in test_cases:
+        mock_update.effective_user.first_name = name
+        await bot.start(mock_update, mock_context)
+        mock_update.message.reply_text.assert_called_with(expected, parse_mode='Markdown')
+        mock_update.message.reply_text.reset_mock()
+
+
+@pytest.mark.asyncio
+async def test_weather_command(bot, mock_update, mock_context):
+    """тест погоды"""
+    test_cases = [
+        ({
+             'main': {'temp': 20},
+             'weather': [{'description': 'sunny'}]
+         }, 200, "Прогноз погоды"),
+        ({
+             'main': {'temp': -10},
+             'weather': [{'description': 'snow'}]
+         }, 200, "Прогноз погоды"),
+    ]
+
+    for weather_data, status_code, expected_response in test_cases:
+        with patch('requests.get') as mock_get:
+            mock_get.return_value = Mock(
+                status_code=status_code,
+                json=Mock(return_value=weather_data)
+            )
+            with patch.object(bot, 'send_to_groq_api',
+                              return_value=expected_response):
+                await bot.weather_command(mock_update, mock_context)
+                mock_update.message.reply_text.assert_called_with(
+                    expected_response,
+                    parse_mode='Markdown'
+                )
+                mock_update.message.reply_text.reset_mock()
+
+
+@pytest.mark.asyncio
+async def test_weather_command(bot, mock_update, mock_context):
+    """тест обработки ошибок команды погоды"""
+    with patch('requests.get') as mock_get:
+        # Test API error
+        mock_get.side_effect = requests.exceptions.RequestException("API Error")
+        await bot.weather_command(mock_update, mock_context)
+        assert "удалось получить данные" in mock_update.message.reply_text.call_args[0][0]
+
+        # Test invalid city
+        mock_get.return_value = Mock(status_code=404)
+        await bot.weather_command(mock_update, mock_context)
+        assert "удалось получить данные" in mock_update.message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_handle_message(bot, mock_update, mock_context):
+    """тест сообщений в разных типах чатов"""
+    test_cases = [
+        ("private", "Привет бот", True),
+        ("group", "Привет бот", False),  # групповой чат без упоминания
+        ("group", "@test_bot Привет", True),  # групповой чат с упоминанием
+        ("supergroup", "Ответ боту", True),
+    ]
+
+    mock_response = "Тестовый ответ"
+    for chat_type, message_text, should_respond in test_cases:
+        mock_update.message.chat.type = chat_type
+        mock_update.message.text = message_text
+
+        if chat_type != "private":
+            # Setup reply to bot scenario
+            mock_update.message.reply_to_message = AsyncMock(
+                from_user=AsyncMock(id=mock_context.bot.id) 
+            ) if "Ответ боту" in message_text else None
+
+        with patch.object(bot, 'send_to_groq_api',
+                          new_callable=AsyncMock,
+                          return_value=mock_response):
+            await bot.handle_message(mock_update, mock_context)
+
+            if should_respond:
+                mock_update.message.reply_text.assert_called_with(
+                    mock_response,
+                    parse_mode='Markdown'
+                )
+            else:
+                mock_update.message.reply_text.assert_not_called()
+
+            mock_update.message.reply_text.reset_mock()
+
+
+@pytest.mark.asyncio
+async def test_summarize_messages(bot, mock_update, mock_context, mock_db):
+    """тест всех сообщений"""
+    _, mock_cursor = mock_db
+    test_cases = [
+        ([], "Нет сообщений за последние 20 минут."),
+        ([(123, "Тестовое сообщение 1"), (123, "Тестовое сообщение 2")], "Сводка сообщений"),
+        ([(123, "Сообщение пользователя 1"), (456, "Сообщение пользователя 2")], "Сводка сообщений"),
+    ]
+
+    for messages, expected_response in test_cases:
+        mock_cursor.fetchall.return_value = messages
+        with patch.object(bot, 'send_to_groq_api',
+                          new_callable=AsyncMock,
+                          return_value=expected_response):
+            await bot.summarize_messages(mock_update, mock_context)
+            if not messages:
+                mock_update.message.reply_text.assert_called_with(
+                    "Нет сообщений за последние 20 минут.",
+                    parse_mode='Markdown'
+                )
+            else:
+                mock_update.message.reply_text.assert_called_with(
+                    expected_response,
+                    parse_mode='Markdown'
+                )
+            mock_update.message.reply_text.reset_mock()
+
+
+@pytest.mark.asyncio
+async def test_send_to_groq_api(bot, mock_update):
+    """ответы на разные команды"""
+    test_cases = [
+        ('/summ', "Тестовое сообщение", "Ответ сводки"),
+        ('/weather', "Данные о погоде", "Прогноз погоды"),
+        ('other_command', "Обычное сообщение", "Обычный ответ"),
+    ]
+
+    for command, message, expected_response in test_cases:
+        with patch.object(bot.client.chat.completions, 'create',
+                          return_value=AsyncMock(
+                              choices=[AsyncMock(message=AsyncMock(content=expected_response))]
+                          )):
+            response = await bot.send_to_groq_api(message, command)
+            assert response == expected_response
+
+
+@pytest.mark.asyncio
+async def test_bold_text(bot, mock_update, mock_context):
+    """форматирование текста в жирный шрифт"""
+    await bot.bold_text(mock_update, mock_context)
+    mock_update.message.reply_text.assert_called_once_with(
+        "*Вот жирный текст*",
+        parse_mode='Markdown'
+    )
+
+
+@pytest.mark.asyncio
+async def test_messages_dlina(bot, mock_update, mock_context, mock_db):
+    _, mock_cursor = mock_db
+
+    # Мпытаемся превысить ограничение в 4096 символов при объединении
+    long_message = "A" * 1000
+    mock_messages = [("user1", long_message) for _ in range(5)]
+    mock_cursor.fetchall.return_value = mock_messages
+
+    await bot.get_messages(mock_update, mock_context)
+    calls = mock_update.message.reply_text.call_count
+    assert calls > 1, f"ожидалось больше 1 вызова, но получено {calls}"
+
+
+if __name__ == '__main__':
+    pytest.main(['-v'])
